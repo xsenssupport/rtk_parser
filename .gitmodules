@@ -1,0 +1,3 @@
+[submodule "rtk_interfaces"]
+	path = rtk_interfaces
+	url = https://github.com/xsenssupport/rtk_interfaces.git
