@@ -232,6 +232,22 @@ class RTCMMessageParser:
         return parsed
 
     @staticmethod
+    def parse_1230(data):
+        """Parse GLONASS Code-Phase Biases"""
+        return {
+            "message_type": "1230",
+            "description": "GLONASS Code-Phase Biases",
+            "station_id": data.get("DF003", None),
+            "bias_indicator": data.get("DF001", None),
+            "biases": {
+                "L1CA": data.get("DF417", None),
+                "L1P": data.get("DF418", None),
+                "L2CA": data.get("DF419", None),
+                "L2P": data.get("DF420", None)
+            }
+        }
+
+    @staticmethod
     def parse_message(msg_type, data):
         """Main parsing function"""
         parsing_functions = {
@@ -240,6 +256,7 @@ class RTCMMessageParser:
             "1006": RTCMMessageParser.parse_1006,
             "1012": RTCMMessageParser.parse_1012,
             "1033": RTCMMessageParser.parse_1033,
+            "1230": RTCMMessageParser.parse_1230,
         }
         
         # MSM4 messages

@@ -6,14 +6,19 @@ from mavros_msgs.msg import RTCM
 from nmea_msgs.msg import Sentence
 from sensor_msgs.msg import NavSatFix
 from diagnostic_msgs.msg import DiagnosticArray
+from rtk_interfaces.msg import RTKAnalysis
 from std_msgs.msg import Float64
 import numpy as np
 from pyrtcm import RTCMReader
+import json
+from datetime import datetime
 
 from rtk_parser.rtcm_message_parser import RTCMMessageParser
 from rtk_parser.rtk_utils import RTKUtils
 from rtk_parser.rtk_diagnostics import RTKDiagnostics
 from rtk_interfaces.msg import BaselineStatus, GNSSStatus, Satellite
+from diagnostic_msgs.msg import DiagnosticStatus, DiagnosticArray, KeyValue
+
 
 class RTKParser(Node):
     def __init__(self):
@@ -29,6 +34,7 @@ class RTKParser(Node):
         self.pub_gnss_status = self.create_publisher(GNSSStatus, '/rtcm_parser/gnss_status', 10)
         self.pub_satellite = self.create_publisher(Satellite, '/rtcm_parser/satellite_info', 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, '/rtcm_parser/rtk_diagnostics', 10)
+        self.pub_analysis = self.create_publisher(RTKAnalysis, '/rtcm_parser/rtk_analysis', 10)
         
         # Subscribers
         self.create_subscription(RTCM, '/rtcm', self.rtcm_callback, 10)
@@ -41,7 +47,12 @@ class RTKParser(Node):
         self.rtcm_msg_types = set()
         self.receiver_info = None
         
-
+        self.parsed_messages = []
+        self.max_messages = 1000  # Limit to prevent memory overflow
+        
+        # Timer for periodic analysis
+        self.analysis_timer = self.create_timer(1.0, self.perform_analysis)  # Run every 1 second
+        
         self.get_logger().info("RTK Parser node initialized")
 
     def nmea_callback(self, msg: Sentence):
@@ -90,17 +101,29 @@ class RTKParser(Node):
             self.get_logger().error(f"Error in RTCM callback: {str(e)}")
 
     def process_rtcm_message(self, parsed_data: dict):
-        """Process parsed RTCM message based on type."""
-        msg_type = parsed_data.get('message_type')
-        
-        if msg_type in ['1005', '1006']:
-            self.handle_base_position(parsed_data)
-        elif msg_type in ['1074', '1084', '1094', '1124', '1075', '1085', '1095', '1125']:
-            self.handle_msm_message(parsed_data)
-        elif msg_type in ['1033']:
-            self.handle_receiver_info(parsed_data)
+            """Process parsed RTCM message based on type."""
+            # Add timestamp and store the message
+            parsed_data['timestamp'] = datetime.now().isoformat()
+            self.parsed_messages.append(parsed_data)
+            if len(self.parsed_messages) > self.max_messages:
+                self.parsed_messages.pop(0)
             
-        self.publish_diagnostics()
+            msg_type = parsed_data.get('message_type')
+            
+            if msg_type in ['1005', '1006']:
+                self.handle_base_position(parsed_data)
+            elif msg_type in ['1074', '1084', '1094', '1124', '1075', '1085', '1095', '1125']:
+                self.handle_msm_message(parsed_data)
+            elif msg_type in ['1033']:
+                self.handle_receiver_info(parsed_data)
+            elif msg_type in ['1230']:
+                self.handle_glonass_biases(parsed_data)
+                
+            self.publish_diagnostics()
+
+    def handle_glonass_biases(self, data: dict):
+            """Process GLONASS bias messages."""
+            self.get_logger().info(f"GLONASS Biases: {data.get('biases', {})}")
 
     def parse_nmea_gga(self, sentence: str) -> NavSatFix:
         """
@@ -286,35 +309,241 @@ class RTKParser(Node):
         diag_array = DiagnosticArray()
         diag_array.header.stamp = self.get_clock().now().to_msg()
         
-        # Add satellite count diagnostic
+        # Satellite count
         sat_count = len(self.satellite_data)
         level, message = RTKDiagnostics.check_satellite_count(sat_count)
         diag_array.status.append(
             RTKDiagnostics.create_diagnostic_status(
-                "Satellite Count",
-                level,
-                message,
-                {"count": sat_count}
+                "Satellite Count", level, message, {"count": sat_count}
             )
         )
         
-        # Add signal strength diagnostic
+        # Signal strength
         if self.satellite_data:
-            avg_snr = np.mean([
-                sat.get('signal_strength', 0.0) 
-                for sat in self.satellite_data.values()
-            ])
+            avg_snr = np.mean([sat.get('signal_strength', 0.0) for sat in self.satellite_data.values()])
             level, message = RTKDiagnostics.check_snr(avg_snr)
             diag_array.status.append(
                 RTKDiagnostics.create_diagnostic_status(
-                    "Signal Strength",
+                    "Signal Strength", level, message, {"average_snr": f"{avg_snr:.1f}"}
+                )
+            )
+        
+        # Critical messages check
+        stats = self.calculate_message_statistics()
+        if stats["critical_messages_check"]["missing_1005_1006"]:
+            diag_array.status.append(
+                RTKDiagnostics.create_diagnostic_status(
+                    "Critical Messages",
+                    DiagnosticStatus.WARN,
+                    "Missing base station position (1005/1006)",
+                    {}
+                )
+            )
+        if stats["critical_messages_check"]["missing_1033"]:
+            diag_array.status.append(
+                RTKDiagnostics.create_diagnostic_status(
+                    "Critical Messages",
+                    DiagnosticStatus.WARN,
+                    "Missing receiver/antenna info (1033)",
+                    {}
+                )
+            )
+        
+        # Signal quality per system
+        signal_quality = self.analyze_signal_quality()
+        for system, quality in signal_quality.items():
+            level = DiagnosticStatus.OK if quality["quality_assessment"] == "Good" else \
+                   DiagnosticStatus.WARN if quality["quality_assessment"] == "Marginal" else \
+                   DiagnosticStatus.ERROR
+            diag_array.status.append(
+                RTKDiagnostics.create_diagnostic_status(
+                    f"{system.upper()} Signal Quality",
                     level,
-                    message,
-                    {"average_snr": f"{avg_snr:.1f}"}
+                    f"{quality['quality_assessment']} signal quality",
+                    {"average_snr": f"{quality['average_snr']:.1f}"}
                 )
             )
         
         self.pub_diagnostics.publish(diag_array)
+
+
+    def calculate_message_statistics(self):
+        """Calculate message statistics."""
+        message_counts = {}
+        for msg in self.parsed_messages:
+            msg_type = msg.get("message_type")
+            if msg_type:
+                message_counts[msg_type] = message_counts.get(msg_type, 0) + 1
+        
+        total_messages = len(self.parsed_messages)
+        time_span = {
+            "start": min((msg.get("timestamp", "") for msg in self.parsed_messages), default=""),
+            "end": max((msg.get("timestamp", "") for msg in self.parsed_messages), default="")
+        }
+        critical_messages_check = {
+            "missing_1005_1006": not any(msg.get("message_type") in ["1005", "1006"] for msg in self.parsed_messages),
+            "missing_1033": not any(msg.get("message_type") == "1033" for msg in self.parsed_messages)
+        }
+        
+        return {
+            "total_messages": total_messages,
+            "message_counts": message_counts,
+            "time_span": time_span,
+            "critical_messages_check": critical_messages_check
+        }
+
+    def analyze_signal_quality(self):
+        """Analyze signal quality per GNSS system."""
+        msm_types = {
+            "gps": ["1074", "1075", "1077"],
+            "glonass": ["1084", "1085", "1087"],
+            "galileo": ["1094", "1095", "1097"],
+            "beidou": ["1124", "1125", "1127"]
+        }
+        
+        signal_quality = {}
+        
+        for system, msg_types in msm_types.items():
+            satellites = []
+            for msg in self.parsed_messages:
+                if msg.get("message_type") in msg_types:
+                    for sat in msg.get("satellites", []):
+                        if sat.get("PRN") and sat.get("signal_strength") is not None:
+                            satellites.append({
+                                "PRN": sat["PRN"],
+                                "SNR": float(sat["signal_strength"]),
+                                "quality": "Good" if sat["signal_strength"] > 40 else "Marginal" if sat["signal_strength"] > 30 else "Poor"
+                            })
+            
+            if satellites:
+                avg_snr = sum(sat["SNR"] for sat in satellites) / len(satellites)
+                signal_quality[system] = {
+                    "average_snr": avg_snr,
+                    "quality_assessment": "Good" if avg_snr > 40 else "Marginal" if avg_snr > 30 else "Poor"
+                }
+        
+        return signal_quality
+
+    def get_most_recent_message(self, msg_types):
+        """Get the most recent message from a list of message types."""
+        candidates = [msg for msg in self.parsed_messages if msg.get("message_type") in msg_types]
+        if candidates:
+            return max(candidates, key=lambda x: x["timestamp"])
+        return None
+
+    def analyze_overall(self):
+        """Perform overall RTK analysis using the most recent messages."""
+        # Define MSM message types for each GNSS system
+        msm_types = {
+            "gps": ["1074", "1075", "1077"],
+            "glonass": ["1084", "1085", "1087"],
+            "galileo": ["1094", "1095", "1097"],
+            "beidou": ["1124", "1125", "1127"]
+        }
+
+        # Track unique satellites and SNR values
+        unique_satellites = set()  # Use a set to ensure no duplicates
+        total_snr_sum = 0.0
+        total_sats_for_snr = 0
+        sat_info = {}
+
+        # Process the most recent message for each system
+        for system, msg_types in msm_types.items():
+            recent_msg = self.get_most_recent_message(msg_types)
+            if recent_msg:
+                satellites = recent_msg.get("satellites", [])
+                # Collect unique PRNs from this message
+                for sat in satellites:
+                    prn = sat.get("PRN")
+                    if prn:
+                        unique_satellites.add(f"{system}_{prn}")  # e.g., "gps_G01", "glonass_R01"
+
+                # Store satellite count for this system
+                sat_info[system] = {"num_satellites": len(satellites)}
+
+                # Calculate SNR for quality assessment
+                snr_values = [sat.get("signal_strength", 0.0) for sat in satellites if sat.get("signal_strength") is not None]
+                if snr_values:
+                    total_snr_sum += sum(snr_values)
+                    total_sats_for_snr += len(snr_values)
+
+        # Total satellites is the number of unique satellites across all systems
+        total_sats = len(unique_satellites)
+        avg_snr_all = total_snr_sum / total_sats_for_snr if total_sats_for_snr > 0 else 0.0
+
+        # Compile overall analysis
+        overall = {
+            "total_satellites": total_sats,
+            "average_snr_all_systems": avg_snr_all,
+            "rtk_fix_likelihood": "High" if avg_snr_all > 40 and total_sats >= 10 else
+                                 "Medium" if avg_snr_all > 30 and total_sats >= 8 else "Low",
+            "multi_gnss_usage": len([sys for sys in sat_info if sat_info[sys]["num_satellites"] > 0]),
+            "potential_issues": [],
+            "recommendations": []
+        }
+
+        # Add potential issues and recommendations
+        if avg_snr_all < 35:
+            overall["potential_issues"].append("Low overall signal strength")
+            overall["recommendations"].append("Check sky view and reduce interference")
+        if total_sats < 8:
+            overall["potential_issues"].append("Low satellite count")
+            overall["recommendations"].append("Wait for better satellite visibility")
+
+        return overall
+
+
+    def perform_analysis(self):
+        """Perform and publish all analyses."""
+        stats = self.calculate_message_statistics()
+        signal_quality = self.analyze_signal_quality()
+        overall = self.analyze_overall()
+        
+        # Compile base station info
+        base_info = next((msg for msg in self.parsed_messages if msg.get("message_type") in ["1005", "1006"]), None)
+        base_station_info = base_info if base_info else {}
+        
+        # Compile antenna/receiver info
+        antenna_info = next((msg for msg in self.parsed_messages if msg.get("message_type") == "1033"), None) or {}
+        
+        # Compile GLONASS biases
+        glonass_biases = next((msg for msg in self.parsed_messages if msg.get("message_type") == "1230"), None) or {}
+        
+        # Compile satellite info for detailed output (optional)
+        msm_types = {
+            "gps": ["1074", "1075", "1077"],
+            "glonass": ["1084", "1085", "1087"],
+            "galileo": ["1094", "1095", "1097"],
+            "beidou": ["1124", "1125", "1127"]
+        }
+        # sat_info = {}
+        # for system, msg_types in msm_types.items():
+        #     recent_msg = self.get_most_recent_message(msg_types)
+        #     if recent_msg:
+        #         satellites = recent_msg.get("satellites", [])
+        #         sat_info[system] = {
+        #             "num_satellites": len(satellites),
+        #             "satellites": satellites
+        #         }
+        
+        # Create and publish RTKAnalysis message
+        analysis_msg = RTKAnalysis()
+        analysis_msg.header.stamp = self.get_clock().now().to_msg()
+        analysis_msg.timestamp = datetime.now().isoformat()
+        analysis_msg.total_messages = stats["total_messages"]
+        analysis_msg.message_counts = json.dumps(stats["message_counts"])
+        analysis_msg.time_span = json.dumps(stats["time_span"])
+        analysis_msg.critical_messages_check = json.dumps(stats["critical_messages_check"])
+        analysis_msg.base_station_info = json.dumps(base_station_info)
+        analysis_msg.antenna_info = json.dumps(antenna_info)
+        analysis_msg.signal_quality = json.dumps(signal_quality)
+        # analysis_msg.satellite_info = json.dumps(sat_info)
+        analysis_msg.glonass_biases = json.dumps(glonass_biases)
+        analysis_msg.overall_analysis = json.dumps(overall)
+        
+        self.pub_analysis.publish(analysis_msg)
+
+
 
 def main(args=None):
     rclpy.init(args=args)

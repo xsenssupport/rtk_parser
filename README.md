@@ -91,6 +91,7 @@ ros2 launch rtk_parser rtk_parser.launch.py debug:=true
 | `/rtcm_parser/gnss_status`     | `rtk_parser/GNSSStatus`           | GNSS system status    |
 | `/rtcm_parser/satellite_info`  | `rtk_parser/Satellite`            | Individual satellite information |
 | `/rtcm_parser/rtk_diagnostics` | `diagnostic_msgs/DiagnosticArray` | System diagnostics    |
+| `/rtcm_parser/rtk_analysis`    | `rtk_parser/RTKAnalysis`          | RTCM analysis         |
 
 ### Subscribed Topics
 | Topic Name | Message Type         | Description                     |
@@ -101,14 +102,23 @@ ros2 launch rtk_parser rtk_parser.launch.py debug:=true
 ### Monitor Topics
 ```bash
 # Monitor baseline status
-ros2 topic echo /baseline_status
+ros2 topic echo /rtcm_parser/baseline_status
 
 # Monitor GNSS status
-ros2 topic echo /gnss_status
+ros2 topic echo /rtcm_parser/gnss_status
 
 # Monitor diagnostics
-ros2 topic echo /rtk_diagnostics
+ros2 topic echo /rtcm_parser/rtk_diagnostics
+
+# Monitor rtk_analysis with full length message
+ros2 topic echo /rtcm_parser/rtk_analysis --full-length
+
+# Redirect the output to a file 
+ros2 topic echo /rtcm_parser/rtk_analysis --full-length > rtcm_analysis.txt
 ```
+
+
+
 
 ## Custom Messages
 This package uses custom message types defined in the [rtk_interfaces](https://github.com/xsenssupport/rtk_interfaces) package. Please ensure you have this package installed.
